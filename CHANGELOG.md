@@ -8,6 +8,10 @@ Tool counts in parentheses indicate the cumulative total after the change.
 
 ## [Unreleased]
 
+### Fixed
+
+- `--list-tools`, `--list-permissions` and `--verify-login` no longer truncate their JSON when stdout is a pipe. They printed with `console.log` and exited at once; Node writes to a pipe asynchronously, so `node dist/index.js --list-tools | jq` received the first 64 KiB and a parse error. They now exit once the document has been handed to the OS.
+
 ## [0.17.0] — 2026-10-19
 
 ### Added — device lookup by name list (674 tools)
