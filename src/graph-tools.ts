@@ -17,11 +17,18 @@ import { wrapUntrustedContent } from './untrusted-envelope.js';
 import { shallowBodySchema } from './advertised-schema.js';
 import { effectiveRiskLevel, isToolAllowed, type RiskLevel } from './risk-level.js';
 import {
+  collectReportPages,
+  initialSkip,
+  reportMaxRowsFromEnv,
+  type ReportPage,
+} from './report-pagination.js';
+import {
   hasGuardrails,
   runGuardrails,
   type GraphReader,
   type GuardrailResult,
 } from './guardrails.js';
+import { compositeTools, type CompositeTool } from './composite-tools.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -40,6 +47,8 @@ interface EndpointConfig {
   acceptType?: string;
   returnDownloadUrl?: boolean;
   apiVersion?: 'v1.0' | 'beta';
+  /** Tabular Intune report action: accepts allPages / dedupeBy (report-pagination.ts). */
+  reportPagination?: boolean;
 }
 
 // SEC-A (SEC-001): allowlist for skip-encoded path parameters. The previous
@@ -122,7 +131,10 @@ const endpointConfigByTool = new Map(endpointsData.map((e) => [e.toolName, e]));
 
 /** Each tool with its README section — the input to `resolvePartition`. */
 export function endpointSections(): { toolName: string; section: string }[] {
-  return endpointsData.map(({ toolName, section }) => ({ toolName, section }));
+  return [...endpointsData, ...compositeTools].map(({ toolName, section }) => ({
+    toolName,
+    section,
+  }));
 }
 
 /** One group of a tool partition, as served on `/mcp/<group>`. */
@@ -241,6 +253,43 @@ function appendErrorHints(result: CallToolResult, hints: string[]): CallToolResu
   };
 }
 
+function parseReportPage(result: CallToolResult): ReportPage {
+  const text = result.content?.[0]?.text ?? '';
+  if (result.isError) throw new Error(text);
+  return JSON.parse(text) as ReportPage;
+}
+
+/**
+ * Walks the remaining pages of a tabular Intune report — see
+ * report-pagination.ts. The merged table replaces the first page before the
+ * untrusted-content envelope is applied, so every row is still wrapped.
+ */
+async function paginateReport(
+  first: CallToolResult,
+  body: Record<string, unknown>,
+  fullPath: string,
+  requestOptions: Record<string, unknown>,
+  graphClient: GraphClient,
+  dedupeBy: string | undefined
+): Promise<CallToolResult> {
+  const merged = await collectReportPages(
+    parseReportPage(first),
+    initialSkip(body),
+    async (skip) =>
+      parseReportPage(
+        (await graphClient.graphRequest(fullPath, {
+          ...requestOptions,
+          body: JSON.stringify({ ...body, skip }),
+        })) as CallToolResult
+      ),
+    { dedupeBy, maxRows: reportMaxRowsFromEnv() }
+  );
+  logger.info(
+    `Report paginated: ${merged.pagination.pagesFetched} page(s), ${merged.pagination.rowsReturned} row(s)`
+  );
+  return { content: [{ type: 'text', text: JSON.stringify(merged) }] };
+}
+
 async function executeGraphTool(
   tool: (typeof api.endpoints)[0],
   config: EndpointConfig | undefined,
@@ -278,7 +327,10 @@ async function executeGraphTool(
     let body: unknown = null;
 
     for (const [paramName, paramValue] of Object.entries(params)) {
-      if (paramName === 'excludeResponse') {
+      if (
+        paramName === 'excludeResponse' ||
+        (config?.reportPagination && (paramName === 'allPages' || paramName === 'dedupeBy'))
+      ) {
         continue;
       }
 
@@ -412,6 +464,25 @@ async function executeGraphTool(
     // becomes part of the LLM context. Errors pass through unchanged.
     let graphResult = (await graphClient.graphRequest(fullPath, requestOptions)) as CallToolResult;
 
+    if (
+      config?.reportPagination &&
+      params.allPages === true &&
+      !params.excludeResponse &&
+      !graphResult.isError &&
+      body !== null &&
+      typeof body === 'object' &&
+      !Array.isArray(body)
+    ) {
+      graphResult = await paginateReport(
+        graphResult,
+        body as Record<string, unknown>,
+        fullPath,
+        requestOptions,
+        graphClient,
+        typeof params.dedupeBy === 'string' && params.dedupeBy !== '' ? params.dedupeBy : undefined
+      );
+    }
+
     if (graphResult.isError && guardrail && guardrail.errorHints.length > 0) {
       graphResult = appendErrorHints(graphResult, guardrail.errorHints);
     }
@@ -433,6 +504,28 @@ async function executeGraphTool(
     return wrapped;
   } catch (error) {
     logger.error(`Error executing tool ${tool.alias}: ${(error as Error).message}`);
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
+      isError: true,
+    };
+  }
+}
+
+/**
+ * Runs a composite tool (composite-tools.ts) under the same contract as
+ * executeGraphTool: parameter names logged, never values; a successful result
+ * wrapped in the untrusted-content envelope; a failure returned as an error.
+ */
+async function executeCompositeTool(
+  composite: CompositeTool,
+  graphClient: GraphClient,
+  params: Record<string, unknown>
+): Promise<CallToolResult> {
+  logger.info(`Tool ${composite.toolName} called with params: [${Object.keys(params).join(', ')}]`);
+  try {
+    return wrapUntrustedContent(await composite.run(graphClient, params), composite.toolName);
+  } catch (error) {
+    logger.error(`Error executing tool ${composite.toolName}: ${(error as Error).message}`);
     return {
       content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
       isError: true,
@@ -467,19 +560,18 @@ export function registerGraphTools(
 
   const registeredTools: [CatalogEntry, RegisteredTool][] = [];
 
-  for (const tool of api.endpoints) {
-    const endpointConfig = endpointConfigByTool.get(tool.alias);
-
-    if (readOnly && tool.method.toUpperCase() !== 'GET') {
+  // Every tool, generated or composite, passes the same controls in this order.
+  const admit = (alias: string, method: string, riskLevel: RiskLevel | undefined): boolean => {
+    if (readOnly && method.toUpperCase() !== 'GET') {
       skippedCount++;
-      continue;
+      return false;
     }
 
     // SEC-G01: cap tool registration by risk level. Applies to both reads and writes.
     // Sensitive-read GETs annotated with a riskLevel (SEC-G03) are also filtered here.
-    if (!isToolAllowed(endpointConfig?.riskLevel, tool.method, maxRiskLevel)) {
+    if (!isToolAllowed(riskLevel, method, maxRiskLevel)) {
       skippedByRisk++;
-      continue;
+      return false;
     }
 
     // Per-caller write tier filter (HTTP mode with Entra App Roles).
@@ -487,26 +579,33 @@ export function registerGraphTools(
     // server started without role-based gating) — preserve legacy behavior.
     // A non-undefined Set is authoritative: writes whose effective tier is
     // absent from the set are not registered for this caller.
-    if (writeRiskTiers !== undefined && tool.method.toUpperCase() !== 'GET') {
-      const tier = effectiveRiskLevel(endpointConfig?.riskLevel, tool.method);
+    if (writeRiskTiers !== undefined && method.toUpperCase() !== 'GET') {
+      const tier = effectiveRiskLevel(riskLevel, method);
       if (!writeRiskTiers.has(tier)) {
         skippedByRole++;
-        continue;
+        return false;
       }
     }
 
-    if (enabledToolsRegex && !enabledToolsRegex.test(tool.alias)) {
+    if (enabledToolsRegex && !enabledToolsRegex.test(alias)) {
       skippedCount++;
-      continue;
+      return false;
     }
 
     // Per-group endpoint (`/mcp/<group>`): narrows the catalog, never widens
     // it — every control above has already run. `undefined` serves the full
     // catalog, as `/mcp` and stdio always have.
-    if (group !== undefined && !group.tools.has(tool.alias)) {
+    if (group !== undefined && !group.tools.has(alias)) {
       skippedCount++;
-      continue;
+      return false;
     }
+
+    return true;
+  };
+
+  for (const tool of api.endpoints) {
+    const endpointConfig = endpointConfigByTool.get(tool.alias);
+    if (!admit(tool.alias, tool.method, endpointConfig?.riskLevel)) continue;
 
     const entry = catalogEntry(tool, endpointConfig);
     const clientForTool =
@@ -524,6 +623,29 @@ export function registerGraphTools(
       registeredCount++;
     } catch (error) {
       logger.error(`Failed to register tool ${tool.alias}: ${(error as Error).message}`);
+      failedCount++;
+    }
+  }
+
+  for (const composite of compositeTools) {
+    if (!admit(composite.toolName, composite.method, composite.riskLevel)) continue;
+
+    const entry = compositeCatalogEntry(composite);
+    const clientForTool =
+      entry.requiresAppOnly && appOnlyGraphClient ? appOnlyGraphClient : graphClient;
+
+    try {
+      const registered = server.tool(
+        composite.toolName,
+        entry.description,
+        entry.inputShape,
+        entry.annotations,
+        async (params) => executeCompositeTool(composite, clientForTool, params)
+      );
+      registeredTools.push([entry, registered]);
+      registeredCount++;
+    } catch (error) {
+      logger.error(`Failed to register tool ${composite.toolName}: ${(error as Error).message}`);
       failedCount++;
     }
   }
@@ -585,6 +707,20 @@ function catalogEntry(
   if (cached) return cached;
   const entry = buildCatalogEntry(tool, endpointConfig);
   catalog.set(tool.alias, entry);
+  return entry;
+}
+
+function compositeCatalogEntry(composite: CompositeTool): CatalogEntry {
+  const cached = catalog.get(composite.toolName);
+  if (cached) return cached;
+  const entry: CatalogEntry = {
+    name: composite.toolName,
+    description: describeTool(composite.description, composite, composite.method),
+    inputShape: composite.inputShape,
+    annotations: toolAnnotations(composite.toolName, composite.method),
+    requiresAppOnly: requiresAppOnly(composite.appPermissions),
+  };
+  catalog.set(composite.toolName, entry);
   return entry;
 }
 
@@ -687,48 +823,82 @@ function buildCatalogEntry(
     .describe('Exclude the full response body and only return success or failure')
     .optional();
 
-  let toolDescription =
-    tool.description || `Execute ${tool.method.toUpperCase()} request to ${tool.path}`;
-  if (endpointConfig?.llmTip) {
-    toolDescription += `\n\nTIP: ${endpointConfig.llmTip}`;
+  if (endpointConfig?.reportPagination) {
+    paramSchema['allPages'] = z
+      .boolean()
+      .describe(
+        'Fetch every page server-side (Graph returns at most 50 rows per call) until TotalRowCount, ' +
+          'starting from body.skip. Capped by MS365_ADMIN_MCP_REPORT_MAX_ROWS (default 5000); ' +
+          'the response carries a pagination block saying whether it was truncated.'
+      )
+      .optional();
+    paramSchema['dedupeBy'] = z
+      .string()
+      .describe(
+        'With allPages: report column whose value identifies a row (e.g. DeviceName); ' +
+          'later rows with the same value are dropped.'
+      )
+      .optional();
   }
-  if (endpointConfig?.riskLevel) {
+
+  return {
+    name: tool.alias,
+    description: describeTool(
+      tool.description || `Execute ${tool.method.toUpperCase()} request to ${tool.path}`,
+      endpointConfig,
+      tool.method
+    ),
+    inputShape: paramSchema,
+    annotations: toolAnnotations(tool.alias, tool.method),
+    requiresAppOnly: requiresAppOnly(endpointConfig?.appPermissions),
+  };
+}
+
+/** Base description, then the llmTip and the risk copy, as the model reads them. */
+function describeTool(
+  base: string,
+  config: { llmTip?: string; riskLevel?: RiskLevel } | undefined,
+  method: string
+): string {
+  let toolDescription = base;
+  if (config?.llmTip) {
+    toolDescription += `\n\nTIP: ${config.llmTip}`;
+  }
+  if (config?.riskLevel) {
     // SEC-G03: read-operation risk copy differs from write-operation copy.
-    const isWrite = tool.method.toUpperCase() !== 'GET';
+    const isWrite = method.toUpperCase() !== 'GET';
     let riskCopy = '';
     if (isWrite) {
-      if (endpointConfig.riskLevel === 'critical') {
+      if (config.riskLevel === 'critical') {
         riskCopy =
           'This action is irreversible or has major security impact. Always confirm with the operator before executing.';
-      } else if (endpointConfig.riskLevel === 'high') {
+      } else if (config.riskLevel === 'high') {
         riskCopy =
           'This action has significant impact. Verify the target carefully before executing.';
       }
     } else {
-      if (endpointConfig.riskLevel === 'high') {
+      if (config.riskLevel === 'high') {
         riskCopy =
           'This response contains secrets or highly sensitive data (e.g. recovery keys, LAPS passwords, legal-hold material). Do not echo verbatim; confirm with the operator before sharing.';
-      } else if (endpointConfig.riskLevel === 'medium') {
+      } else if (config.riskLevel === 'medium') {
         riskCopy =
           'This response contains PII or authentication metadata (sign-ins, MFA factors, mail metadata, risk detections). Handle with care and avoid casual disclosure.';
       }
     }
-    toolDescription += `\n\nRISK LEVEL: ${endpointConfig.riskLevel.toUpperCase()}. ${riskCopy}`;
+    toolDescription += `\n\nRISK LEVEL: ${config.riskLevel.toUpperCase()}. ${riskCopy}`;
   }
+  return toolDescription;
+}
 
-  const requiresAppOnly =
-    endpointConfig?.appPermissions?.some((p) => APP_ONLY_PERMISSIONS.has(p)) ?? false;
-
+function toolAnnotations(name: string, method: string): ToolAnnotations {
   return {
-    name: tool.alias,
-    description: toolDescription,
-    inputShape: paramSchema,
-    annotations: {
-      title: tool.alias,
-      readOnlyHint: tool.method.toUpperCase() === 'GET',
-      destructiveHint: ['POST', 'PATCH', 'DELETE'].includes(tool.method.toUpperCase()),
-      openWorldHint: true,
-    },
-    requiresAppOnly,
+    title: name,
+    readOnlyHint: method.toUpperCase() === 'GET',
+    destructiveHint: ['POST', 'PATCH', 'DELETE'].includes(method.toUpperCase()),
+    openWorldHint: true,
   };
+}
+
+function requiresAppOnly(appPermissions: string[] | undefined): boolean {
+  return appPermissions?.some((p) => APP_ONLY_PERMISSIONS.has(p)) ?? false;
 }
